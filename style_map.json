@@ -1,0 +1,13 @@
+{
+  "amitaro": {
+    "Angry": "03",
+    "Happy": "04",
+    "Sad": "01",
+    "Neutral": "Neutral"
+  },
+  "koharune-ami": {
+    "Happy": "るんるん",
+    "Neutral": "ノーマル",
+    "Sad": "よふかし"
+  }
+}

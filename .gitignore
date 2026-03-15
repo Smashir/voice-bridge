@@ -1,0 +1,42 @@
+# WebUI runtime data
+webui/data/
+webui/data/**
+webui/data/cache/
+webui/data/vector_db/
+webui/data/uploads/
+webui/data/webui.db
+webui/logs/
+webui/cache/
+
+# Python environments
+__pycache__/
+*.pyc
+*.pyo
+.orchestrator_env/
+venv/
+.venv/
+
+# OS / Editor
+.vscode/
+.DS_Store
+*.swp
+*.log
+
+# Binary / model files
+*.bin
+*.safetensors
+*.pt
+*.onnx
+
+# Misc
+*.zip
+.env
+*.env
+*.sqlite3
+
+.git_local_temp/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
