@@ -28,6 +28,8 @@ from voice_bridge.gar_client import chat_async
 from voice_bridge.gar_profile_client import fetch_runtime_profile_async
 from voice_bridge.tts_base import load_tts_config_from_env, build_tts
 
+from voice_bridge.render_plan_client import fetch_render_plan_async
+
 settings = Settings()
 app = FastAPI(title="Voice Bridge", version="3.0")
 
@@ -295,6 +297,8 @@ async def audio_speech(req: Request):
     if not text:
         raise HTTPException(status_code=400, detail="missing 'input'")
 
+    spoken_text = text
+
     # Optional hints
     style = body.get("style")
     style_weight = body.get("style_weight")
@@ -350,6 +354,17 @@ async def audio_speech(req: Request):
 
     if completion_id:
         try:
+            plan = await fetch_render_plan_async(settings.gar_base_url, completion_id)
+            if isinstance(plan, dict):
+                candidate = plan.get("speech_text")
+                if isinstance(candidate, str) and candidate.strip():
+                    spoken_text = candidate.strip()
+                    print("[voice-bridge] speech_text from render_plan =", repr(spoken_text[:200]))
+        except Exception as e:
+            print("[voice-bridge] render_plan fetch failed:", type(e).__name__, str(e)[:200])        
+
+    if completion_id:
+        try:
             prof = await fetch_runtime_profile_async(settings.gar_base_url, completion_id)
 
             baseline = None
@@ -388,15 +403,15 @@ async def audio_speech(req: Request):
         print("[voice-bridge] FINAL style =", kwargs.get("style"), "weight =", kwargs.get("style_weight"))  
         print("[voice-bridge] FINAL voice_id =", kwargs.get("voice_id"))
         try:
-            audio_f32, sr = await tts.synthesize_async(text, **kwargs)
+            audio_f32, sr = await tts.synthesize_async(spoken_text, **kwargs)
         except Exception as e:
             # persona 指定が外れても落とさない（まずデフォルトへフォールバック）
             print("[voice-bridge] TTS failed, fallback to DEFAULT_VOICE_ID. err=", repr(e))
             kwargs["voice_id"] = os.getenv("DEFAULT_VOICE_ID", "sbv2:jvnv-F1-jp:0")
-            audio_f32, sr = await tts.synthesize_async(text, **kwargs)
+            audio_f32, sr = await tts.synthesize_async(spoken_text, **kwargs)
 
     else:
-        audio_f32, sr = tts.synthesize(text, **kwargs)
+        audio_f32, sr = tts.synthesize(spoken_text, **kwargs)
 
     wav = f32_to_wav_bytes(audio_f32, sr)
 
