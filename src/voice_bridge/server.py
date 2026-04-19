@@ -30,6 +30,8 @@ from voice_bridge.tts_base import load_tts_config_from_env, build_tts
 
 from voice_bridge.render_plan_client import fetch_render_plan_async
 
+from voice_bridge.scene_audio import render_scene_audio_async
+
 settings = Settings()
 app = FastAPI(title="Voice Bridge", version="3.0")
 
@@ -281,23 +283,26 @@ async def audio_speech(req: Request):
     OpenAI-like TTS endpoint.
     Request body typically:
       { "model": "...", "input": "text", "voice": "...", "format": "wav" }
-    We require 'input' (or 'text').
 
     Extra (optional):
       - completion_id: chat completion id (chatcmpl-...)
       - voice_id: engine-namespaced voice id (e.g. sbv2:jvnv-F1-jp:0)
+
+    New behavior:
+      - if GAR render_plan exists and has segments, render scene audio
+      - otherwise fall back to ordinary single-utterance TTS
     """
     body = await req.json()
     tts = req.app.state.tts
     if tts is None:
         raise HTTPException(status_code=503, detail="TTS is not configured")
 
-
     text = body.get("input") or body.get("text")
     if not text:
         raise HTTPException(status_code=400, detail="missing 'input'")
 
     spoken_text = text
+    render_plan = None
 
     # Optional hints
     style = body.get("style")
@@ -310,42 +315,32 @@ async def audio_speech(req: Request):
         parts = v.split(":")
         return len(parts) >= 2 and parts[0].strip() in engines_set and all(p.strip() for p in parts[:2])
 
-
     DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "sbv2:jvnv-F1-jp:0")
 
     # OpenWebUI fields
-    tts_model = body.get("model")   # 「TTSモデル」欄（例: sbv2 / tts-1）
-    voice = body.get("voice")       # 「TTSボイス」欄（例: alloy / jvnv-F1-jp:0）
+    tts_model = body.get("model")
+    voice = body.get("voice")
     voice_id_in = body.get("voice_id")
-
-    # engines supported by voice-bridge (comma-separated)
-    engines = [s.strip() for s in os.getenv("VOICE_BRIDGE_AUDIO_ENGINES", "sbv2").split(",") if s.strip()]
-    engines_set = set(engines)
 
     voice_id = None
 
-    # 1) 明示指定 voice_id は最優先（namespaced必須）
+    # 1) explicit voice_id wins
     if isinstance(voice_id_in, str) and voice_id_in.strip():
         v = voice_id_in.strip()
         if not _is_namespaced(v):
             raise HTTPException(status_code=400, detail=f"voice_id must be namespaced like 'sbv2:...': {v}")
         voice_id = v
 
-    # 2) voice がすでに namespaced ならそのまま採用
+    # 2) namespaced voice field
     elif isinstance(voice, str) and voice.strip() and _is_namespaced(voice.strip()):
         voice_id = voice.strip()
 
-    # 3) model(=engine) + voice(=local_id) を結合（tts_model が engines に含まれる場合だけ）
+    # 3) model(=engine) + voice(=local_id)
     elif isinstance(tts_model, str) and tts_model.strip() and tts_model.strip() in engines_set:
         if isinstance(voice, str) and voice.strip():
-            # voice は local_id。中に ":" が含まれてもOK（深さ固定しない）
             voice_id = f"{tts_model.strip()}:{voice.strip()}"
         else:
-            # voice が空なら engine のデフォルトへ
             voice_id = DEFAULT_VOICE_ID
-
-    # 4) それ以外（alloy等）はヒント扱いで捨てる。後段で runtime_profile or DEFAULT に落ちる
-
 
     completion_id = body.get("completion_id")
 
@@ -354,14 +349,14 @@ async def audio_speech(req: Request):
 
     if completion_id:
         try:
-            plan = await fetch_render_plan_async(settings.gar_base_url, completion_id)
-            if isinstance(plan, dict):
-                candidate = plan.get("speech_text")
+            render_plan = await fetch_render_plan_async(settings.gar_base_url, completion_id)
+            if isinstance(render_plan, dict):
+                candidate = render_plan.get("speech_text")
                 if isinstance(candidate, str) and candidate.strip():
                     spoken_text = candidate.strip()
                     print("[voice-bridge] speech_text from render_plan =", repr(spoken_text[:200]))
         except Exception as e:
-            print("[voice-bridge] render_plan fetch failed:", type(e).__name__, str(e)[:200])        
+            print("[voice-bridge] render_plan fetch failed:", type(e).__name__, str(e)[:200])
 
     if completion_id:
         try:
@@ -381,7 +376,7 @@ async def audio_speech(req: Request):
             s2, w2 = _emotion_to_style(axes, baseline)
             print("[voice-bridge] axes =", axes, "baseline =", baseline)
             print("[voice-bridge] mapped style =", s2, "mapped weight =", w2)
-            print("[voice-bridge] completion_id =", completion_id)            
+            print("[voice-bridge] completion_id =", completion_id)
 
             if style is None and s2 is not None:
                 style = s2
@@ -391,7 +386,6 @@ async def audio_speech(req: Request):
         except Exception as e:
             print("[voice-bridge] runtime_profile fetch failed:", type(e).__name__, str(e)[:200])
 
-    # ---- final fallback: ensure voice_id is always set for SBV2 ----
     if not voice_id:
         voice_id = DEFAULT_VOICE_ID
 
@@ -399,19 +393,25 @@ async def audio_speech(req: Request):
     if voice_id is not None:
         kwargs["voice_id"] = voice_id
 
-    if hasattr(tts, "synthesize_async"):
-        print("[voice-bridge] FINAL style =", kwargs.get("style"), "weight =", kwargs.get("style_weight"))  
-        print("[voice-bridge] FINAL voice_id =", kwargs.get("voice_id"))
-        try:
-            audio_f32, sr = await tts.synthesize_async(spoken_text, **kwargs)
-        except Exception as e:
-            # persona 指定が外れても落とさない（まずデフォルトへフォールバック）
-            print("[voice-bridge] TTS failed, fallback to DEFAULT_VOICE_ID. err=", repr(e))
-            kwargs["voice_id"] = os.getenv("DEFAULT_VOICE_ID", "sbv2:jvnv-F1-jp:0")
-            audio_f32, sr = await tts.synthesize_async(spoken_text, **kwargs)
+    print("[voice-bridge] FINAL style =", kwargs.get("style"), "weight =", kwargs.get("style_weight"))
+    print("[voice-bridge] FINAL voice_id =", kwargs.get("voice_id"))
 
-    else:
-        audio_f32, sr = tts.synthesize(spoken_text, **kwargs)
+    try:
+        audio_f32, sr = await render_scene_audio_async(
+            tts=tts,
+            render_plan=render_plan,
+            fallback_text=spoken_text,
+            tts_kwargs=kwargs,
+        )
+    except Exception as e:
+        print("[voice-bridge] scene render failed, fallback to DEFAULT_VOICE_ID. err=", repr(e))
+        kwargs["voice_id"] = os.getenv("DEFAULT_VOICE_ID", "sbv2:jvnv-F1-jp:0")
+        audio_f32, sr = await render_scene_audio_async(
+            tts=tts,
+            render_plan=render_plan,
+            fallback_text=spoken_text,
+            tts_kwargs=kwargs,
+        )
 
     wav = f32_to_wav_bytes(audio_f32, sr)
 
@@ -424,6 +424,7 @@ async def audio_speech(req: Request):
         headers["x-style-weight"] = str(kwargs["style_weight"])
 
     return Response(content=wav, media_type="audio/wav", headers=headers)
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
