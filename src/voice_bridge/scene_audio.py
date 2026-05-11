@@ -6,12 +6,8 @@ Purpose:
     * speech   -> existing TTS backend
     * foley    -> catalog asset or procedural fallback
     * ambience -> catalog asset or procedural fallback
+    * music    -> catalog asset or simple procedural bed fallback
 - return one mono float32 waveform
-
-Notes:
-- This is intentionally lightweight and dependency-free (numpy only).
-- High-quality ambience/foley should be supplied via VOICE_BRIDGE_SFX_CATALOG.
-- Without a catalog, simple procedural fallback is used.
 """
 
 from __future__ import annotations
@@ -128,30 +124,46 @@ def _load_wav_mono_f32(path: str) -> tuple[np.ndarray, int]:
 
 def _normalize_cue(text: str) -> str:
     value = (text or "").strip()
-    value = re.sub(r"[【】\[\]()<>{}「」『』:：\s]+", "", value)
+    value = re.sub(r"[【】\[\](){}<>「」『』:：\s]+", "", value)
     return value.lower()
+
+
+def _segment_type(seg: dict[str, Any]) -> str:
+    return str(seg.get("type") or seg.get("kind") or "").lower()
+
+
+def _segment_display_text(seg: dict[str, Any]) -> str:
+    return str(seg.get("display_text") or seg.get("text") or "").strip()
+
+
+def _segment_spoken_text(seg: dict[str, Any]) -> str:
+    return str(seg.get("spoken_text") or seg.get("text") or seg.get("display_text") or "").strip()
+
+
+def _segment_cue(seg: dict[str, Any]) -> str:
+    return str(seg.get("cue") or seg.get("prompt") or seg.get("display_text") or seg.get("text") or "").strip()
 
 
 @lru_cache(maxsize=1)
 def _load_catalog() -> dict[str, dict[str, Any]]:
     path = os.getenv("VOICE_BRIDGE_SFX_CATALOG", "").strip()
     if not path:
-        return {"foley": {}, "ambience": {}}
+        return {"foley": {}, "ambience": {}, "music": {}}
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"foley": {}, "ambience": {}}
-        out = {"foley": {}, "ambience": {}}
-        for kind in ("foley", "ambience"):
+            return {"foley": {}, "ambience": {}, "music": {}}
+        out = {"foley": {}, "ambience": {}, "music": {}}
+        for kind in ("foley", "ambience", "music"):
             src = data.get(kind, {})
             if isinstance(src, dict):
                 out[kind] = src
         return out
     except Exception as e:
         print(f"[voice-bridge] WARN: failed to load VOICE_BRIDGE_SFX_CATALOG '{path}': {e}")
-        return {"foley": {}, "ambience": {}}
+        return {"foley": {}, "ambience": {}, "music": {}}
 
 
 def _catalog_entry(kind: str, cue: str) -> tuple[str | None, float | None]:
@@ -225,6 +237,14 @@ def _procedural_swish(sr: int) -> np.ndarray:
     return _normalize_peak(audio, peak=0.75)
 
 
+def _procedural_glass_break(sr: int) -> np.ndarray:
+    hit = _procedural_thud(sr) * 0.55
+    shatter = _procedural_creak(sr) * 0.35
+    tail = _procedural_swish(sr) * 0.28
+    gap = _silence(sr, 35)
+    return _normalize_peak(np.concatenate([hit, gap, shatter, tail]).astype(np.float32), peak=0.92)
+
+
 def _procedural_rain(sr: int, duration_s: float) -> np.ndarray:
     n = max(int(sr * duration_s), int(sr * 0.35))
     t = np.linspace(0.0, n / sr, n, endpoint=False)
@@ -264,41 +284,67 @@ def _procedural_crowd(sr: int, duration_s: float) -> np.ndarray:
     return _normalize_peak(audio, peak=0.18)
 
 
+def _procedural_music_pad(sr: int, duration_s: float) -> np.ndarray:
+    n = max(int(sr * duration_s), int(sr * 1.0))
+    t = np.linspace(0.0, n / sr, n, endpoint=False)
+    chord = (
+        0.22 * np.sin(2.0 * np.pi * 220.0 * t)
+        + 0.18 * np.sin(2.0 * np.pi * 277.18 * t)
+        + 0.16 * np.sin(2.0 * np.pi * 329.63 * t)
+    )
+    lfo = 0.55 + 0.45 * np.sin(2.0 * np.pi * 0.09 * t + 0.3)
+    shimmer = _highpass(np.random.randn(n).astype(np.float32), sr, 2500.0) * 0.02
+    audio = (chord * lfo + shimmer).astype(np.float32)
+    return _normalize_peak(audio, peak=0.16)
+
+
 def _foley_from_cue(cue: str, sr: int) -> np.ndarray:
     text = cue or ""
+    if any(k in text for k in ["カシャン", "ガシャン", "パリン", "割れる", "割れ", "砕け", "破片", "ガラス", "コップ"]):
+        return _procedural_glass_break(sr)
     if any(k in text for k in ["ぎし", "きし", "ミシ", "軋"]):
         return _procedural_creak(sr)
-    if any(k in text for k in ["こと", "こつ", "コト", "コツ", "とん", "トン"]):
+    if any(k in text for k in ["こと", "こつ", "コト", "コツ", "とん", "トン", "コン", "コンッ"]):
         return _procedural_knock(sr)
-    if any(k in text for k in ["どさ", "どん", "ドサ", "ドン", "ばた", "バタ"]):
+    if any(k in text for k in ["どさ", "どん", "ドサ", "ドン", "ばた", "バタ", "落ちる", "落下"]):
         return _procedural_thud(sr)
-    if any(k in text for k in ["さら", "しゃ", "しゅ", "衣擦", "布"]):
+    if any(k in text for k in ["さら", "しゃ", "しゅ", "衣擦", "布", "カサカサ", "ざらり"]):
         return _procedural_swish(sr)
     return _procedural_knock(sr)
 
 
 def _ambience_from_cue(cue: str, sr: int, duration_s: float) -> np.ndarray:
-    text = (cue or "").lower()
-    if "rain" in text or any(k in text for k in ["雨", "ざぁ", "ザー"]):
+    text = cue or ""
+    if "rain" in text.lower() or any(k in text for k in ["雨", "ざぁ", "ザー"]):
         return _procedural_rain(sr, duration_s)
-    if "wind" in text or any(k in text for k in ["風", "びゅ", "ヒュ"]):
+    if "wind" in text.lower() or any(k in text for k in ["風", "びゅ", "ヒュ"]):
         return _procedural_wind(sr, duration_s)
-    if "fire" in text or any(k in text for k in ["焚き火", "暖炉", "炎", "薪"]):
+    if "fire" in text.lower() or any(k in text for k in ["焚き火", "暖炉", "炎", "薪"]):
         return _procedural_fire(sr, duration_s)
-    if "crowd" in text or any(k in text for k in ["雑踏", "群衆", "人混み", "市場"]):
+    if "crowd" in text.lower() or any(k in text for k in ["雑踏", "群衆", "人混み", "市場"]):
         return _procedural_crowd(sr, duration_s)
-    if "forest" in text or any(k in text for k in ["森", "林", "木々", "虫の音"]):
+    if "forest" in text.lower() or any(k in text for k in ["森", "林", "木々", "虫の音"]):
         return _procedural_wind(sr, duration_s) * 0.75
-    if "waves" in text or any(k in text for k in ["波", "潮騒", "海鳴り"]):
+    if "waves" in text.lower() or any(k in text for k in ["波", "潮騒", "海鳴り"]):
         return _procedural_wind(sr, duration_s) * 0.9
-    if "thunder" in text or any(k in text for k in ["雷", "ごろごろ"]):
+    if "thunder" in text.lower() or any(k in text for k in ["雷", "ごろごろ"]):
         base = _procedural_rain(sr, duration_s) * 0.5
         return _normalize_peak(base, peak=0.18)
     return _procedural_wind(sr, duration_s) * 0.65
 
 
+def _music_from_cue(cue: str, sr: int, duration_s: float) -> np.ndarray:
+    text = cue or ""
+    bed = _procedural_music_pad(sr, duration_s)
+    if any(k in text.lower() for k in ["cafe", "jazz", "lounge", "bossa", "piano"]) or any(k in text for k in ["カフェ", "喫茶", "店内BGM"]):
+        crowd = _procedural_crowd(sr, duration_s) * 0.35
+        mixed = bed + crowd
+        return _normalize_peak(mixed.astype(np.float32), peak=0.15)
+    return bed
+
+
 def _catalog_or_procedural_foley(seg: dict[str, Any], sr: int) -> tuple[np.ndarray, float | None]:
-    cue = str(seg.get("cue") or seg.get("text") or "").strip()
+    cue = _segment_cue(seg)
     path, catalog_gain = _catalog_entry("foley", cue)
     if path and os.path.exists(path):
         audio, src_sr = _load_wav_mono_f32(path)
@@ -321,7 +367,7 @@ def _loop_to_length(audio: np.ndarray, target_len: int) -> np.ndarray:
 
 
 def _catalog_or_procedural_ambience(seg: dict[str, Any], sr: int, target_len: int) -> tuple[np.ndarray, float | None]:
-    cue = str(seg.get("cue") or seg.get("text") or "").strip()
+    cue = _segment_cue(seg)
     path, catalog_gain = _catalog_entry("ambience", cue)
     if path and os.path.exists(path):
         audio, src_sr = _load_wav_mono_f32(path)
@@ -332,6 +378,22 @@ def _catalog_or_procedural_ambience(seg: dict[str, Any], sr: int, target_len: in
 
     duration_s = max(target_len / float(sr), 0.35)
     audio = _ambience_from_cue(cue, sr, duration_s)
+    audio = _loop_to_length(audio.astype(np.float32), target_len)
+    return audio, catalog_gain
+
+
+def _catalog_or_procedural_music(seg: dict[str, Any], sr: int, target_len: int) -> tuple[np.ndarray, float | None]:
+    cue = _segment_cue(seg)
+    path, catalog_gain = _catalog_entry("music", cue)
+    if path and os.path.exists(path):
+        audio, src_sr = _load_wav_mono_f32(path)
+        if src_sr != sr:
+            audio = _resample_linear(audio, src_sr, sr)
+        audio = _loop_to_length(audio.astype(np.float32), target_len)
+        return audio, catalog_gain
+
+    duration_s = max(target_len / float(sr), 1.0)
+    audio = _music_from_cue(cue, sr, duration_s)
     audio = _loop_to_length(audio.astype(np.float32), target_len)
     return audio, catalog_gain
 
@@ -356,19 +418,22 @@ async def render_scene_audio_async(
 
     speech_segments = [
         s for s in segments
-        if str(s.get("kind") or "").lower() == "speech" and bool(s.get("audible", True))
+        if _segment_type(s) == "speech" and bool(s.get("audible", True))
     ]
 
     if not speech_segments:
-        text = str(plan.get("speech_text") or fallback_text or "").strip()
+        fallback = ""
+        if not segments:
+            fallback = fallback_text
+        text = str(plan.get("spoken_text") or plan.get("speech_text") or fallback or "").strip()
         if text:
-            speech_segments = [{"kind": "speech", "text": text, "audible": True}]
+            speech_segments = [{"type": "speech", "spoken_text": text, "audible": True}]
 
     sr: int | None = None
     speech_chunks: list[np.ndarray] = []
 
     for seg in speech_segments:
-        text = str(seg.get("text") or "").strip()
+        text = _segment_spoken_text(seg)
         if not text:
             continue
         audio, seg_sr = await _tts_synthesize_async(tts, text, **tts_kwargs)
@@ -383,10 +448,10 @@ async def render_scene_audio_async(
 
     lead_in_chunks: list[np.ndarray] = []
     for seg in segments:
-        kind = str(seg.get("kind") or "").lower()
+        seg_type = _segment_type(seg)
         placement = str(seg.get("placement") or "lead_in").lower()
         audible = bool(seg.get("audible", True))
-        if not audible or kind != "foley" or placement != "lead_in":
+        if not audible or seg_type != "foley" or placement != "lead_in":
             continue
         audio, catalog_gain = _catalog_or_procedural_foley(seg, sr)
         gain_db = float(seg.get("level_db", -10.0))
@@ -413,14 +478,21 @@ async def render_scene_audio_async(
     total = base.astype(np.float32)
 
     for seg in segments:
-        kind = str(seg.get("kind") or "").lower()
+        seg_type = _segment_type(seg)
         placement = str(seg.get("placement") or "").lower()
         audible = bool(seg.get("audible", True))
-        if not audible or kind != "ambience" or placement != "underlay":
+        if not audible or placement != "underlay":
             continue
 
-        bed, catalog_gain = _catalog_or_procedural_ambience(seg, sr, total.size)
-        gain_db = float(seg.get("level_db", -26.0))
+        if seg_type == "ambience":
+            bed, catalog_gain = _catalog_or_procedural_ambience(seg, sr, total.size)
+            gain_db = float(seg.get("level_db", -24.0))
+        elif seg_type == "music":
+            bed, catalog_gain = _catalog_or_procedural_music(seg, sr, total.size)
+            gain_db = float(seg.get("level_db", -28.0))
+        else:
+            continue
+
         if catalog_gain is not None:
             gain_db += float(catalog_gain)
         total = _mix(total, bed, offset=0, gain_db=gain_db)
