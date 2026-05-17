@@ -13,7 +13,6 @@ Important:
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response, JSONResponse
-from typing import Optional
 from collections import OrderedDict
 import time
 import os
@@ -27,13 +26,12 @@ from voice_bridge.audio_utils import bytes_to_16k_mono_f32, f32_to_wav_bytes
 from voice_bridge.gar_client import chat_async
 from voice_bridge.gar_profile_client import fetch_runtime_profile_async
 from voice_bridge.tts_base import load_tts_config_from_env, build_tts
-
 from voice_bridge.render_plan_client import fetch_render_plan_async
-
 from voice_bridge.scene_audio import render_scene_audio_async
 
 settings = Settings()
 app = FastAPI(title="Voice Bridge", version="3.0")
+
 
 @app.on_event("startup")
 async def _startup():
@@ -52,8 +50,6 @@ async def _startup():
         print("[voice-bridge] ASR init failed:", repr(e))
 
 
-
-
 # --- recent completion id cache (client_ip -> completion_id) ---
 # Used when OpenWebUI calls /v1/chat/completions and then /v1/audio/speech separately.
 # If the TTS request does not include completion_id explicitly, we fall back to the latest
@@ -70,7 +66,6 @@ async def list_models():
     1) まず upstream (gar-llm relay) の /v1/models をプロキシする
     2) 失敗したら最低限 gar-llm を返す
     """
-    # LLM_CHAT_URL = http://.../v1/chat/completions から base を作る
     base = settings.llm_chat_url.rsplit("/v1/chat/completions", 1)[0].rstrip("/")
     url = base + "/v1/models"
 
@@ -102,10 +97,8 @@ async def list_audio_models():
     }
 
 
-
 @app.get("/v1/audio/voices")
 async def list_audio_voices():
-    # OpenWebUIのUI用。ここで在庫を表現しようとしない（将来の複数TTSに備える）
     return {
         "object": "list",
         "data": [
@@ -169,7 +162,6 @@ def _emotion_to_style(emotion_axes: dict, baseline: str | None) -> tuple[str | N
     if raw <= 0.05:
         return "Neutral", 0.5
 
-    # 0..1想定の感情値を、SBV2 WebUI相当の 0..20 に拡張
     w = clamp_style_weight(raw * STYLE_WEIGHT_MAX)
 
     b = (baseline or "").lower()
@@ -209,8 +201,6 @@ async def debug_middleware(request: Request, call_next):
                 print("tts json body:", body[:2000])
             except Exception as e:
                 print("tts json read error:", e)
-
-
 
     try:
         resp = await call_next(request)
@@ -264,7 +254,6 @@ async def audio_transcriptions_raw(request: Request):
 
     text = asr.transcribe_16k_mono(audio_f32, language=lang)
 
-
     t = (text or "").strip()
     if t in {"ん", "ン", "え", "あ", "う", "お", "ま", "な"}:
         return {"text": ""}
@@ -287,10 +276,6 @@ async def audio_speech(req: Request):
     Extra (optional):
       - completion_id: chat completion id (chatcmpl-...)
       - voice_id: engine-namespaced voice id (e.g. sbv2:jvnv-F1-jp:0)
-
-    New behavior:
-      - if GAR render_plan exists and has segments, render scene audio
-      - otherwise fall back to ordinary single-utterance TTS
     """
     body = await req.json()
     tts = req.app.state.tts
@@ -304,7 +289,6 @@ async def audio_speech(req: Request):
     spoken_text = text
     render_plan = None
 
-    # Optional hints
     style = body.get("style")
     style_weight = body.get("style_weight")
 
@@ -317,25 +301,18 @@ async def audio_speech(req: Request):
 
     DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "sbv2:jvnv-F1-jp:0")
 
-    # OpenWebUI fields
     tts_model = body.get("model")
     voice = body.get("voice")
     voice_id_in = body.get("voice_id")
-
     voice_id = None
 
-    # 1) explicit voice_id wins
     if isinstance(voice_id_in, str) and voice_id_in.strip():
         v = voice_id_in.strip()
         if not _is_namespaced(v):
             raise HTTPException(status_code=400, detail=f"voice_id must be namespaced like 'sbv2:...': {v}")
         voice_id = v
-
-    # 2) namespaced voice field
     elif isinstance(voice, str) and voice.strip() and _is_namespaced(voice.strip()):
         voice_id = voice.strip()
-
-    # 3) model(=engine) + voice(=local_id)
     elif isinstance(tts_model, str) and tts_model.strip() and tts_model.strip() in engines_set:
         if isinstance(voice, str) and voice.strip():
             voice_id = f"{tts_model.strip()}:{voice.strip()}"
@@ -351,10 +328,10 @@ async def audio_speech(req: Request):
         try:
             render_plan = await fetch_render_plan_async(settings.gar_base_url, completion_id)
             if isinstance(render_plan, dict):
-                candidate = render_plan.get("speech_text")
+                candidate = render_plan.get("spoken_text") or render_plan.get("speech_text")
                 if isinstance(candidate, str) and candidate.strip():
                     spoken_text = candidate.strip()
-                    print("[voice-bridge] speech_text from render_plan =", repr(spoken_text[:200]))
+                    print("[voice-bridge] spoken_text from render_plan =", repr(spoken_text[:200]))
         except Exception as e:
             print("[voice-bridge] render_plan fetch failed:", type(e).__name__, str(e)[:200])
 
@@ -426,6 +403,48 @@ async def audio_speech(req: Request):
     return Response(content=wav, media_type="audio/wav", headers=headers)
 
 
+async def _apply_visible_text_override(data: dict) -> dict:
+    """
+    When chat proxy is used, prefer render_plan.visible_text for UI display.
+    This keeps non-speech tags out of WebUI while preserving direct gar-llm compatibility.
+    """
+    if os.getenv("VOICE_BRIDGE_PREFER_VISIBLE_TEXT", "1") != "1":
+        return data
+
+    if not isinstance(data, dict):
+        return data
+
+    completion_id = data.get("id")
+    if not isinstance(completion_id, str) or not completion_id:
+        return data
+
+    try:
+        plan = await fetch_render_plan_async(settings.gar_base_url, completion_id)
+    except Exception:
+        return data
+
+    if not isinstance(plan, dict):
+        return data
+
+    visible_text = str(plan.get("visible_text") or "").strip()
+    if not visible_text:
+        return data
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return data
+
+    first = choices[0]
+    if not isinstance(first, dict):
+        return data
+
+    message = first.get("message")
+    if isinstance(message, dict):
+        message["content"] = visible_text
+
+    return data
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     """
@@ -443,13 +462,14 @@ async def chat_completions(req: Request):
     extra_headers = {settings.meta_request_header: "1"}
     data = await chat_async(settings.llm_chat_url, body, extra_headers=extra_headers)
 
-    # remember completion_id for this client (for later TTS calls)
     try:
         cid = data.get("id")
         if cid and req.client and req.client.host:
             _remember_completion(req.client.host, cid)
     except Exception:
         pass
+
+    data = await _apply_visible_text_override(data)
 
     allowed = {"id", "object", "created", "model", "choices", "usage", "system_fingerprint"}
     clean = {k: v for k, v in data.items() if k in allowed}
