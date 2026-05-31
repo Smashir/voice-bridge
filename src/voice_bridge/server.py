@@ -66,6 +66,7 @@ async def list_models():
     1) まず upstream (gar-llm relay) の /v1/models をプロキシする
     2) 失敗したら最低限 gar-llm を返す
     """
+    # LLM_CHAT_URL = http://.../v1/chat/completions から base を作る    
     base = settings.llm_chat_url.rsplit("/v1/chat/completions", 1)[0].rstrip("/")
     url = base + "/v1/models"
 
@@ -99,6 +100,7 @@ async def list_audio_models():
 
 @app.get("/v1/audio/voices")
 async def list_audio_voices():
+    # OpenWebUIのUI用。ここで在庫を表現しようとしない（将来の複数TTSに備える） 
     return {
         "object": "list",
         "data": [
@@ -162,6 +164,7 @@ def _emotion_to_style(emotion_axes: dict, baseline: str | None) -> tuple[str | N
     if raw <= 0.05:
         return "Neutral", 0.5
 
+    # 0..1想定の感情値を、SBV2 WebUI相当の 0..20 に拡張
     w = clamp_style_weight(raw * STYLE_WEIGHT_MAX)
 
     b = (baseline or "").lower()
@@ -276,6 +279,12 @@ async def audio_speech(req: Request):
     Extra (optional):
       - completion_id: chat completion id (chatcmpl-...)
       - voice_id: engine-namespaced voice id (e.g. sbv2:jvnv-F1-jp:0)
+
+    Behavior:
+      - if GAR render_plan exists, prefer spoken_text for TTS
+      - if render_plan has typed segments, render scene audio
+      - otherwise fall back to ordinary single-utterance TTS
+      - when chat proxy is enabled, visible_text may be used for WebUI display
     """
     body = await req.json()
     tts = req.app.state.tts
@@ -289,6 +298,7 @@ async def audio_speech(req: Request):
     spoken_text = text
     render_plan = None
 
+    # Optional hints
     style = body.get("style")
     style_weight = body.get("style_weight")
 
@@ -301,18 +311,24 @@ async def audio_speech(req: Request):
 
     DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "sbv2:jvnv-F1-jp:0")
 
+    # Optional hints
     tts_model = body.get("model")
     voice = body.get("voice")
     voice_id_in = body.get("voice_id")
     voice_id = None
 
+    # 1) explicit voice_id wins
     if isinstance(voice_id_in, str) and voice_id_in.strip():
         v = voice_id_in.strip()
         if not _is_namespaced(v):
             raise HTTPException(status_code=400, detail=f"voice_id must be namespaced like 'sbv2:...': {v}")
         voice_id = v
+
+    # 2) namespaced voice field
     elif isinstance(voice, str) and voice.strip() and _is_namespaced(voice.strip()):
         voice_id = voice.strip()
+
+    # 3) model(=engine) + voice(=local_id)
     elif isinstance(tts_model, str) and tts_model.strip() and tts_model.strip() in engines_set:
         if isinstance(voice, str) and voice.strip():
             voice_id = f"{tts_model.strip()}:{voice.strip()}"
@@ -462,6 +478,7 @@ async def chat_completions(req: Request):
     extra_headers = {settings.meta_request_header: "1"}
     data = await chat_async(settings.llm_chat_url, body, extra_headers=extra_headers)
 
+    # remember completion_id for this client (for later TTS calls)
     try:
         cid = data.get("id")
         if cid and req.client and req.client.host:

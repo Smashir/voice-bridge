@@ -40,3 +40,6 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Local handoff/export workspace
+.handoff/
