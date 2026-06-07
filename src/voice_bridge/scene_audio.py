@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import wave
 from functools import lru_cache
 from typing import Any
@@ -106,20 +107,61 @@ def _concat_chunks(chunks: list[np.ndarray], sr: int, gap_ms: int = 80) -> np.nd
 
 
 def _load_wav_mono_f32(path: str) -> tuple[np.ndarray, int]:
-    with wave.open(path, "rb") as wf:
-        sr = wf.getframerate()
-        n = wf.getnframes()
-        sampwidth = wf.getsampwidth()
-        nch = wf.getnchannels()
-        raw = wf.readframes(n)
+    """
+    Load a catalog audio asset as mono float32.
 
-    if sampwidth != 2:
-        raise RuntimeError(f"unsupported wav sampwidth={sampwidth}: {path}")
+    WAV is read directly.
+    Non-WAV files such as mp3 are decoded through ffmpeg into 24kHz mono PCM.
 
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    if nch > 1:
-        audio = audio.reshape(-1, nch).mean(axis=1).astype(np.float32)
-    return audio.astype(np.float32), int(sr)
+    The function name is kept for compatibility with existing call sites.
+    """
+    lower = str(path).lower()
+
+    if lower.endswith(".wav"):
+        with wave.open(path, "rb") as wf:
+            sr = wf.getframerate()
+            n = wf.getnframes()
+            sampwidth = wf.getsampwidth()
+            nch = wf.getnchannels()
+            raw = wf.readframes(n)
+
+        if sampwidth != 2:
+            raise RuntimeError(f"unsupported wav sampwidth={sampwidth}: {path}")
+
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if nch > 1:
+            audio = audio.reshape(-1, nch).mean(axis=1).astype(np.float32)
+        return audio.astype(np.float32), int(sr)
+
+    ffmpeg_bin = os.getenv("VOICE_BRIDGE_FFMPEG", "ffmpeg")
+    cmd = [
+        ffmpeg_bin,
+        "-v", "error",
+        "-i", str(path),
+        "-ac", "1",
+        "-ar", str(DEFAULT_SCENE_SR),
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"ffmpeg not found. Install ffmpeg or set VOICE_BRIDGE_FFMPEG: {path}"
+        ) from e
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"ffmpeg decode failed: {path}: {err}") from e
+
+    audio = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio.astype(np.float32), int(DEFAULT_SCENE_SR)
 
 
 def _normalize_cue(text: str) -> str:
