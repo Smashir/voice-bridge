@@ -1,3 +1,13 @@
+# Ghost Nexus
+
+Formerly `voice-bridge`.
+
+Ghost Nexus is a narrative and multimodal interaction layer for GAR-LLM.
+It connects generated responses and render plans to speech, sound effects,
+ambience, foley, UI clients, and future multimodal agent actions.
+
+The internal Python package currently remains `voice_bridge` for compatibility.
+
 # voice-bridge
 
 STT / TTS bridge for **gar-llm**.
