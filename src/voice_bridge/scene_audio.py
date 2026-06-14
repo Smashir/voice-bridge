@@ -12,6 +12,7 @@ Purpose:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from functools import lru_cache
 from typing import Any
 
 import numpy as np
+from voice_bridge.audio_arranger import build_scene_timeline, render_timeline
 
 
 DEFAULT_SCENE_SR = 24000
@@ -186,6 +188,74 @@ def _segment_cue(seg: dict[str, Any]) -> str:
     return str(seg.get("cue") or seg.get("prompt") or seg.get("display_text") or seg.get("text") or "").strip()
 
 
+def _segment_audio_query(seg: dict[str, Any]) -> str:
+    """Build resolver query from cue + physical description fields."""
+    parts: list[str] = []
+
+    for key in (
+        "cue",
+        "prompt",
+        "description",
+        "material",
+        "action",
+        "count",
+        "scene",
+        "surface",
+        "source",
+    ):
+        value = seg.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text not in parts:
+            parts.append(text)
+
+    return " ".join(parts).strip()
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _segment_gain_db(seg: dict[str, Any], kind: str) -> float:
+    """Return final gain relative to raw source 0 dB.
+
+    Default behavior:
+      - ignore render_plan level_db
+      - use environment variable per audio kind
+      - if env is missing, use 0 dB
+
+    Optional:
+      - VOICE_BRIDGE_USE_RENDER_PLAN_LEVEL_DB=1 makes explicit segment level_db win.
+    """
+    if _env_bool("VOICE_BRIDGE_USE_RENDER_PLAN_LEVEL_DB", False):
+        value = seg.get("level_db")
+        if value is not None:
+            try:
+                return float(value)
+            except Exception:
+                pass
+
+    env_by_kind = {
+        "foley": "VOICE_BRIDGE_FOLEY_GAIN_DB",
+        "ambience": "VOICE_BRIDGE_AMBIENCE_GAIN_DB",
+        "music": "VOICE_BRIDGE_MUSIC_GAIN_DB",
+        "speech": "VOICE_BRIDGE_SPEECH_GAIN_DB",
+    }
+
+    return _env_float(env_by_kind.get(kind, "VOICE_BRIDGE_SFX_GAIN_DB"), 0.0)
+
+
 @lru_cache(maxsize=1)
 def _load_catalog() -> dict[str, dict[str, Any]]:
     path = os.getenv("VOICE_BRIDGE_SFX_CATALOG", "").strip()
@@ -208,35 +278,225 @@ def _load_catalog() -> dict[str, dict[str, Any]]:
         return {"foley": {}, "ambience": {}, "music": {}}
 
 
+@lru_cache(maxsize=1)
+def _load_sfx_resolver_records() -> list[dict[str, Any]]:
+    records_env = os.getenv("VOICE_BRIDGE_SFX_RECORDS", "").strip()
+    if not records_env:
+        return []
+
+    try:
+        from voice_bridge.sfx_asset_resolver import load_records
+
+        records = load_records()
+        if not isinstance(records, list):
+            return []
+        return records
+    except Exception as e:
+        print(f"[voice-bridge] WARN: failed to load SFX records: {type(e).__name__}: {e}")
+        return []
+
+
+def _resolver_entry(kind: str, cue: str) -> tuple[str | None, float | None]:
+    cue = (cue or "").strip()
+    if not cue:
+        return None, None
+
+    records = _load_sfx_resolver_records()
+    if not records:
+        return None, None
+
+    def _env_float_local(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return float(default)
+
+    def _env_bool_local(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    base_min_score = _env_float_local(
+        f"VOICE_BRIDGE_{kind.upper()}_MIN_SCORE",
+        _env_float_local("VOICE_BRIDGE_SFX_MIN_SCORE", 0.0),
+    )
+    mixed_foley_min_score = _env_float_local("VOICE_BRIDGE_MIXED_FOLEY_MIN_SCORE", 140.0)
+    mixed_foley_max_sec = _env_float_local("VOICE_BRIDGE_MIXED_FOLEY_MAX_SEC", 5.0)
+    allow_mixed_foley = _env_bool_local("VOICE_BRIDGE_ALLOW_MIXED_FOLEY", True)
+
+    constraints: dict[str, Any] = {}
+
+    if kind == "ambience":
+        constraints["usages"] = ["ambience"]
+        constraints["prefer_continuity"] = "continuous"
+        constraints["allow_mixed"] = True
+    elif kind == "foley":
+        constraints["usages"] = ["foley"]
+        constraints["prefer_composition"] = "isolated"
+        constraints["allow_mixed"] = True
+    elif kind == "music":
+        constraints["usages"] = ["music"]
+
+    try:
+        from voice_bridge.sfx_asset_resolver import resolve_sfx
+
+        candidates = resolve_sfx(
+            cue,
+            top=5,
+            records=records,
+            constraints=constraints,
+            min_score=base_min_score,
+        )
+    except Exception as e:
+        print(f"[voice-bridge] WARN: SFX resolver failed for cue={cue!r}: {type(e).__name__}: {e}")
+        return None, None
+
+    if not candidates:
+        if os.getenv("VOICE_BRIDGE_SFX_DEBUG", "").strip():
+            print(
+                "[voice-bridge] SFX unresolved:",
+                f"kind={kind}",
+                f"cue={cue!r}",
+                f"min_score={base_min_score:.1f}",
+            )
+        return None, None
+
+    def _duration(rec: dict[str, Any]) -> float | None:
+        for key in ("asset_duration_sec", "duration_sec"):
+            value = rec.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except Exception:
+                pass
+        return None
+
+    def _looks_mixed(rec: dict[str, Any]) -> bool:
+        composition = str(rec.get("composition") or "").lower()
+        if composition == "mixed":
+            return True
+
+        text = " ".join(
+            str(rec.get(k) or "")
+            for k in ("id", "title", "filename", "path", "note", "raw_text", "embedding_text")
+        )
+        text_l = text.lower()
+
+        if "mix音源" in text:
+            return True
+        if "mixed" in text_l:
+            return True
+        return False
+
+    chosen = None
+
+    for cand in candidates:
+        rec = cand.record
+        path = rec.get("path")
+        if not path:
+            continue
+
+        if kind == "foley" and _looks_mixed(rec):
+            dur = _duration(rec)
+
+            if not allow_mixed_foley:
+                if os.getenv("VOICE_BRIDGE_SFX_DEBUG", "").strip():
+                    print(
+                        "[voice-bridge] SFX rejected:",
+                        f"kind={kind}",
+                        f"cue={cue!r}",
+                        f"id={rec.get('id')}",
+                        f"score={cand.score:.1f}",
+                        "reason=mixed_not_allowed",
+                    )
+                continue
+
+            if cand.score < mixed_foley_min_score:
+                if os.getenv("VOICE_BRIDGE_SFX_DEBUG", "").strip():
+                    print(
+                        "[voice-bridge] SFX rejected:",
+                        f"kind={kind}",
+                        f"cue={cue!r}",
+                        f"id={rec.get('id')}",
+                        f"score={cand.score:.1f}",
+                        f"required={mixed_foley_min_score:.1f}",
+                        "reason=mixed_low_score",
+                    )
+                continue
+
+            if dur is not None and mixed_foley_max_sec > 0.0 and dur > mixed_foley_max_sec:
+                if os.getenv("VOICE_BRIDGE_SFX_DEBUG", "").strip():
+                    print(
+                        "[voice-bridge] SFX rejected:",
+                        f"kind={kind}",
+                        f"cue={cue!r}",
+                        f"id={rec.get('id')}",
+                        f"duration={dur:.2f}s",
+                        f"max={mixed_foley_max_sec:.2f}s",
+                        "reason=mixed_too_long",
+                    )
+                continue
+
+        chosen = cand
+        break
+
+    if chosen is None:
+        if os.getenv("VOICE_BRIDGE_SFX_DEBUG", "").strip():
+            print(
+                "[voice-bridge] SFX unresolved after filtering:",
+                f"kind={kind}",
+                f"cue={cue!r}",
+            )
+        return None, None
+
+    rec = chosen.record
+    path = rec.get("path")
+    if not path:
+        return None, None
+
+    if os.getenv("VOICE_BRIDGE_SFX_DEBUG", "").strip():
+        print(
+            "[voice-bridge] SFX resolved:",
+            f"kind={kind}",
+            f"cue={cue!r}",
+            f"id={rec.get('id')}",
+            f"score={chosen.score:.1f}",
+            f"path={path}",
+        )
+
+    return str(path), None
+
 def _catalog_entry(kind: str, cue: str) -> tuple[str | None, float | None]:
     table = _load_catalog().get(kind, {})
-    if not isinstance(table, dict) or not table:
-        return None, None
 
     raw_key = (cue or "").strip()
     norm_key = _normalize_cue(raw_key)
 
-    candidates = [raw_key, norm_key]
-    for key in candidates:
-        val = table.get(key)
-        if isinstance(val, str):
-            return val, None
-        if isinstance(val, dict):
-            path = val.get("path")
-            gain_db = val.get("gain_db")
-            return (str(path) if path else None), (float(gain_db) if gain_db is not None else None)
-
-    for k, v in table.items():
-        nk = _normalize_cue(str(k))
-        if nk == norm_key or nk in norm_key or norm_key in nk:
-            if isinstance(v, str):
-                return v, None
-            if isinstance(v, dict):
-                path = v.get("path")
-                gain_db = v.get("gain_db")
+    if isinstance(table, dict) and table:
+        candidates = [raw_key, norm_key]
+        for key in candidates:
+            val = table.get(key)
+            if isinstance(val, str):
+                return val, None
+            if isinstance(val, dict):
+                path = val.get("path")
+                gain_db = val.get("gain_db")
                 return (str(path) if path else None), (float(gain_db) if gain_db is not None else None)
 
-    return None, None
+        for k, v in table.items():
+            nk = _normalize_cue(str(k))
+            if nk == norm_key or nk in norm_key or norm_key in nk:
+                if isinstance(v, str):
+                    return v, None
+                if isinstance(v, dict):
+                    path = v.get("path")
+                    gain_db = v.get("gain_db")
+                    return (str(path) if path else None), (float(gain_db) if gain_db is not None else None)
+
+    # Fallback: provider-independent records resolver.
+    return _resolver_entry(kind, raw_key)
 
 
 def _procedural_knock(sr: int) -> np.ndarray:
@@ -444,7 +704,7 @@ async def _tts_synthesize_async(tts, text: str, **kwargs) -> tuple[np.ndarray, i
     if hasattr(tts, "synthesize_async"):
         audio, sr = await tts.synthesize_async(text, **kwargs)
         return audio.astype(np.float32), int(sr)
-    audio, sr = tts.synthesize(text, **kwargs)
+    audio, sr = await asyncio.to_thread(tts.synthesize, text, **kwargs)
     return audio.astype(np.float32), int(sr)
 
 
@@ -455,93 +715,160 @@ async def render_scene_audio_async(
     fallback_text: str,
     tts_kwargs: dict[str, Any],
 ) -> tuple[np.ndarray, int]:
-    plan = render_plan if isinstance(render_plan, dict) else {}
-    segments = [s for s in (plan.get("segments") or []) if isinstance(s, dict)]
+    """Render speech + scene SFX.
 
-    speech_segments = [
-        s for s in segments
-        if _segment_type(s) == "speech" and bool(s.get("audible", True))
-    ]
+    New arranger behavior:
+    - ambience/music starts at 0.0 sec and covers the whole scene
+    - before_speech foley plays after a short lead-in
+    - speech starts after foley + gap
+    - after_speech foley plays after the spoken line
+    - ambience/music is looped/trimmed, faded, and ducked during speech
 
-    if not speech_segments:
-        fallback = ""
-        if not segments:
-            fallback = fallback_text
-        text = str(plan.get("spoken_text") or plan.get("speech_text") or fallback or "").strip()
-        if text:
-            speech_segments = [{"type": "speech", "spoken_text": text, "audible": True}]
+    Safety:
+    - If VOICE_BRIDGE_SCENE_ARRANGER=0, this still falls back to a simple
+      speech-first mix path.
+    - If no render_plan/segments are present, ordinary TTS remains unchanged.
+    """
 
-    sr: int | None = None
-    speech_chunks: list[np.ndarray] = []
+    text = (fallback_text or "").strip()
+    plan = render_plan if isinstance(render_plan, dict) else None
+    segments = plan.get("segments") if isinstance(plan, dict) else None
 
-    for seg in speech_segments:
-        text = _segment_spoken_text(seg)
-        if not text:
-            continue
-        audio, seg_sr = await _tts_synthesize_async(tts, text, **tts_kwargs)
-        if sr is None:
-            sr = seg_sr
-        elif seg_sr != sr:
-            audio = _resample_linear(audio, seg_sr, sr)
-        speech_chunks.append(audio.astype(np.float32))
+    if not isinstance(segments, list) or not segments:
+        audio, sr = await _tts_synthesize_async(tts, text, **tts_kwargs)
+        return audio.astype(np.float32), int(sr)
 
-    if sr is None:
-        sr = DEFAULT_SCENE_SR
-
-    lead_in_chunks: list[np.ndarray] = []
-    for seg in segments:
-        seg_type = _segment_type(seg)
-        placement = str(seg.get("placement") or "lead_in").lower()
-        audible = bool(seg.get("audible", True))
-        if not audible or seg_type != "foley" or placement != "lead_in":
-            continue
-        audio, catalog_gain = _catalog_or_procedural_foley(seg, sr)
-        gain_db = float(seg.get("level_db", -10.0))
-        if catalog_gain is not None:
-            gain_db += float(catalog_gain)
-        lead_in_chunks.append(audio.astype(np.float32) * _db_to_gain(gain_db))
-
-    lead_in = _concat_chunks(lead_in_chunks, sr, gap_ms=60)
-    speech_audio = _concat_chunks(
-        speech_chunks,
-        sr,
-        gap_ms=int(os.getenv("VOICE_BRIDGE_SPEECH_GAP_MS", "120")),
-    )
-
-    if lead_in.size > 0 and speech_audio.size > 0:
-        base = np.concatenate([lead_in, speech_audio]).astype(np.float32)
-    elif lead_in.size > 0:
-        base = lead_in.astype(np.float32)
-    elif speech_audio.size > 0:
-        base = speech_audio.astype(np.float32)
-    else:
-        base = _silence(sr, 250)
-
-    total = base.astype(np.float32)
+    speech_texts: list[str] = []
+    foley_segments: list[dict[str, Any]] = []
+    ambience_segments: list[dict[str, Any]] = []
+    music_segments: list[dict[str, Any]] = []
 
     for seg in segments:
-        seg_type = _segment_type(seg)
-        placement = str(seg.get("placement") or "").lower()
-        audible = bool(seg.get("audible", True))
-        if not audible or placement != "underlay":
+        if not isinstance(seg, dict):
             continue
 
-        if seg_type == "ambience":
-            bed, catalog_gain = _catalog_or_procedural_ambience(seg, sr, total.size)
-            gain_db = float(seg.get("level_db", -24.0))
-        elif seg_type == "music":
-            bed, catalog_gain = _catalog_or_procedural_music(seg, sr, total.size)
-            gain_db = float(seg.get("level_db", -28.0))
-        else:
+        typ = _segment_type(seg)
+
+        if typ == "speech" and bool(seg.get("audible", True)):
+            st = _segment_spoken_text(seg)
+            if st:
+                speech_texts.append(st)
             continue
 
-        if catalog_gain is not None:
-            gain_db += float(catalog_gain)
-        total = _mix(total, bed, offset=0, gain_db=gain_db)
+        if typ == "foley" and bool(seg.get("audible", True)):
+            foley_segments.append(seg)
+            continue
 
-    total = total.astype(np.float32)
-    peak = float(np.max(np.abs(total))) if total.size else 0.0
-    if peak > 0.99:
-        total = (total / peak * 0.97).astype(np.float32)
+        if typ == "ambience" and bool(seg.get("audible", True)):
+            ambience_segments.append(seg)
+            continue
 
-    return total.astype(np.float32), int(sr)
+        if typ == "music" and bool(seg.get("audible", True)):
+            music_segments.append(seg)
+            continue
+
+    speech_text = "\n".join(speech_texts).strip() or text
+
+    speech_audio, speech_sr = await _tts_synthesize_async(tts, speech_text, **tts_kwargs)
+    sr = int(speech_sr)
+    speech_audio = speech_audio.astype(np.float32)
+
+    def _load_segment_audio(kind: str, seg: dict[str, Any], duration_hint_sec: float = 4.0) -> np.ndarray:
+        cue = _segment_cue(seg)
+        resolver_query = _segment_audio_query(seg) or cue
+        path, catalog_gain = _catalog_entry(kind, resolver_query)
+
+        if path:
+            try:
+                audio, asset_sr = _load_wav_mono_f32(path)
+                if int(asset_sr) != sr:
+                    audio = _resample_linear(audio, int(asset_sr), sr)
+                return audio.astype(np.float32)
+            except Exception as e:
+                print(f"[voice-bridge] WARN: failed to load SFX asset kind={kind} cue={cue!r}: {e}")
+
+        # Keep a small procedural safety net for common cases.
+        q = (cue + " " + resolver_query).lower()
+
+        if kind == "ambience":
+            if "雨" in cue or "rain" in q:
+                return _procedural_rain(sr, duration_hint_sec).astype(np.float32)
+            if "風" in cue or "wind" in q:
+                return _procedural_wind(sr, duration_hint_sec).astype(np.float32)
+
+        if kind == "foley":
+            if "ノック" in cue or "knock" in q or "叩" in cue:
+                one = _procedural_knock(sr)
+                gap = _silence(sr, 140)
+                return np.concatenate([one, gap, one, gap, one]).astype(np.float32)
+            if "ドア" in cue or "扉" in cue:
+                return _procedural_creak(sr).astype(np.float32)
+            if "ガラス" in cue:
+                return _procedural_glass_break(sr).astype(np.float32)
+
+        return np.zeros(0, dtype=np.float32)
+
+    foley_items: list[dict[str, Any]] = []
+    for seg in foley_segments:
+        audio = _load_segment_audio("foley", seg, duration_hint_sec=1.0)
+        if audio.size == 0:
+            continue
+        level = seg.get("level_db")
+        foley_items.append(
+            {
+                "segment": seg,
+                "cue": _segment_cue(seg),
+                "audio": audio,
+                "gain_db": _segment_gain_db(seg, "foley"),
+            }
+        )
+
+    ambience_items: list[dict[str, Any]] = []
+    for seg in ambience_segments:
+        audio = _load_segment_audio("ambience", seg, duration_hint_sec=8.0)
+        if audio.size == 0:
+            continue
+        level = seg.get("level_db")
+        ambience_items.append(
+            {
+                "segment": seg,
+                "cue": _segment_cue(seg),
+                "audio": audio,
+                "gain_db": _segment_gain_db(seg, "ambience"),
+            }
+        )
+
+    music_items: list[dict[str, Any]] = []
+    for seg in music_segments:
+        audio = _load_segment_audio("music", seg, duration_hint_sec=8.0)
+        if audio.size == 0:
+            continue
+        level = seg.get("level_db")
+        music_items.append(
+            {
+                "segment": seg,
+                "cue": _segment_cue(seg),
+                "audio": audio,
+                "gain_db": _segment_gain_db(seg, "music"),
+            }
+        )
+
+    use_arranger = os.getenv("VOICE_BRIDGE_SCENE_ARRANGER", "1").strip().lower() not in {"0", "false", "off", "no"}
+
+    if use_arranger:
+        timeline = build_scene_timeline(
+            speech_audio=speech_audio,
+            speech_text=speech_text,
+            foley_items=foley_items,
+            ambience_items=ambience_items,
+            music_items=music_items,
+            sr=sr,
+        )
+        return render_timeline(timeline, sr), sr
+
+    # Legacy-ish fallback: speech first, then simple overlays at 0 sec.
+    out = speech_audio.astype(np.float32)
+    for item in ambience_items + music_items + foley_items:
+        out = _mix(out, item["audio"], offset=0, gain_db=float(item.get("gain_db", 0.0)))
+
+    return _normalize_peak(out), sr
